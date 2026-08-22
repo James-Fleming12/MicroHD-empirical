@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import sys
 
 import numpy as np
@@ -10,7 +11,7 @@ import torch
 sys.path.insert(0, ".")
 
 from modules.data import make_domain_shift_task
-from modules.hdc import HDClassifier, HDCConfig, IDEncoder, ProjectionEncoder, build_encoder
+from modules.hdc import HDClassifier, HDCConfig, IDEncoder, ProjectionEncoder, bipolar_sign, build_encoder
 from modules.metrics import clustering_metrics, geometry_fidelity, ood_detection_auroc
 from modules.microhd import MicroHDOptimizer
 from modules.resources import memory_bits, memory_kb
@@ -95,6 +96,52 @@ def test_novelty_metrics_smoke():
     assert m["hungarian_acc"] > 0.95
     auroc = ood_detection_auroc(np.random.rand(200) + 1.0, np.random.rand(200))
     assert 0.5 < auroc
+
+def test_dpq_components():
+    from modules.dpqhd import (
+        CompressedHDCModel,
+        DecomposedEncoder,
+        TruncatedEncoder,
+        decompose_projection,
+        dpq_memory_bits,
+        mse_ptq,
+        truncate_class_hvs,
+    )
+
+    torch.manual_seed(0)
+    F, D = 16, 2048
+    P = torch.randn(D, F) / math.sqrt(F)
+    x = torch.randn(64, F)
+
+    # rank == F SVD decomposition reconstructs the encoder exactly
+    a, b = decompose_projection(P, rank=F, mode="svd")
+    enc_full = DecomposedEncoder(a, b)
+    assert (enc_full.encode(x) == bipolar_sign(x @ P.T)).all()
+
+    # lower-rank decomposition differs but stays valid bipolar
+    a2, b2 = decompose_projection(P, rank=4, mode="svd")
+    h4 = DecomposedEncoder(a2, b2).encode(x)
+    assert set(h4.unique().tolist()) <= {-1.0, 1.0}
+
+    # truncation at keep=dim equals baseline
+    base_enc = ProjectionEncoder(F, D, seed=0)
+    clf_hv = torch.randn(5, D)
+    m_base = CompressedHDCModel(base_enc, clf_hv)
+    m_trunc = CompressedHDCModel(TruncatedEncoder(base_enc, D), truncate_class_hvs(clf_hv, D))
+    assert torch.allclose(m_base.scores(x), m_trunc.scores(x))
+
+    # MSE PTQ error decreases with bitwidth
+    T = torch.randn(1000, 32)
+    errs = [((mse_ptq(T, b) - T) ** 2).mean().item() for b in (2, 3, 5)]
+    assert errs[0] > errs[1] > errs[2], errs
+
+    # memory model sanity: Q strictly below fp pipeline
+    mem_fp = dpq_memory_bits(F, 5, D)
+    mem_q = dpq_memory_bits(F, 5, D, bits_p=3, bits_w=3)
+    mem_dpq = dpq_memory_bits(F, 5, D, decomposition=True, rank=8, keep_dim=D // 2,
+                              bits_p=3, bits_w=3)
+    assert mem_fp > mem_q > mem_dpq > 0
+
 
 if __name__ == "__main__":
     import time
