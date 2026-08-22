@@ -1,0 +1,108 @@
+"""Sanity tests for the HDC framework. Run: python -m tests.test_sanity"""
+
+from __future__ import annotations
+
+import sys
+
+import numpy as np
+import torch
+
+sys.path.insert(0, ".")
+
+from modules.data import make_domain_shift_task
+from modules.hdc import HDClassifier, HDCConfig, IDEncoder, ProjectionEncoder, build_encoder
+from modules.metrics import clustering_metrics, geometry_fidelity, ood_detection_auroc
+from modules.microhd import MicroHDOptimizer
+from modules.resources import memory_bits, memory_kb
+
+def test_level_hv_structure():
+    enc = IDEncoder(num_features=8, dim=2048, num_levels=64, seed=0)
+    L = enc.level_hvs
+    cos = lambda a, b: torch.nn.functional.cosine_similarity(a, b, dim=1)
+    adj = cos(L[:-1], L[1:]).mean().item()
+    ends = cos(L[:1], L[-1:]).item()
+    assert adj > 0.8, f"adjacent level sim {adj}"   # ~= 1 - (1-eps**(1/(L-1)))
+    assert abs(ends) < 0.15, f"endpoint sim {ends}"  # ~= eps_endpoint/2
+
+def test_geometry_preservation_high_dim():
+    torch.manual_seed(0)
+    x = torch.randn(400, 32)
+    enc = ProjectionEncoder(32, 4096, seed=0)
+    fid = geometry_fidelity(enc, x, n_points=300)
+    assert fid > 0.85, f"projection geometry fidelity {fid:.3f} too low at d=4096"
+    enc_small = ProjectionEncoder(32, 64, seed=0)
+    fid_small = geometry_fidelity(enc_small, x, n_points=300)
+    assert fid_small < fid, "expected worse geometry at d=64"
+
+def test_classifier_on_blobs():
+    task = make_domain_shift_task(seed=0, train_per_class=200, target_per_class=50, num_classes=10, spread=1.0)
+    cfg = HDCConfig(encoding="proj", dim=4096)
+    enc = build_encoder(cfg, task.x_train.shape[1], seed=1)
+    enc.fit_feature_range(task.x_train)
+    clf = HDClassifier(enc, int(task.y_train.max()) + 1).fit(task.x_train, task.y_train, epochs=10, seed=1)
+    acc_src = (clf.predict(task.x_test_src).cpu() == task.y_test_src).float().mean().item()
+    acc_t1 = (clf.predict(task.targets[0][1]).cpu() == task.targets[0][2]).float().mean().item()
+    print(f"  proj d=4096: src={acc_src:.3f} shift1={acc_t1:.3f}")
+    assert acc_src > 0.8, f"source accuracy {acc_src}"
+
+def test_quantization_effect():
+    task = make_domain_shift_task(seed=0, train_per_class=150)
+    accs = {}
+    for bits in (16, 3):
+        cfg = HDCConfig(encoding="id", dim=1024, levels=64, quant_bits=bits)
+        enc = build_encoder(cfg, task.x_train.shape[1], seed=1)
+        enc.fit_feature_range(task.x_train)
+        clf = HDClassifier(enc, int(task.y_train.max()) + 1).fit(task.x_train, task.y_train, epochs=10, seed=1)
+        accs[bits] = (clf.predict(task.x_test_src, deploy_bits=bits).cpu() == task.y_test_src).float().mean().item()
+    print(f"  id d=1024: q16={accs[16]:.3f} q3={accs[3]:.3f}")
+    assert accs[3] <= accs[16] + 0.02
+
+def test_resource_model():
+    # Table 1: ID-level total = d*(f + l + c*q); Proj total = d*q*(f + c)
+    cfg_id = HDCConfig(encoding="id", dim=1000, levels=128, quant_bits=4)
+    assert memory_bits(cfg_id, 30, 5) == 1000 * (30 + 128 + 5 * 4)
+    cfg_p = HDCConfig(encoding="proj", dim=1000, quant_bits=8)
+    assert memory_bits(cfg_p, 30, 5) == 1000 * 8 * 35
+    assert memory_kb(cfg_id, 30, 5) > 0
+
+def test_optimizer_shrinks_and_respects_threshold():
+    task = make_domain_shift_task(seed=3, train_per_class=80, target_per_class=40,
+                                  target_shift_norms=(6.0,), target_noises=(1.15,),
+                                  num_classes=12)
+    opt = MicroHDOptimizer(
+        baseline_config=HDCConfig(encoding="proj", dim=4096),
+        x_train=task.x_train, y_train=task.y_train,
+        x_val=task.x_val, y_val=task.y_val,
+        threshold=0.05, epochs=8, seed=0,
+        ladders={"dim": [64, 256, 1024, 4096], "quant_bits": [2, 4, 8, 16]},
+    )
+    res = opt.optimize()
+    from modules.resources import memory_kb
+    m_before = memory_kb(res.baseline_config, task.x_train.shape[1], 10)
+    m_after = memory_kb(res.config, task.x_train.shape[1], 10)
+    drop = res.baseline_val_acc - res.final_val_acc
+    print(f"  {res.baseline_config} -> {res.config}; mem {m_before:.0f}->{m_after:.0f} KB; "
+          f"val {res.baseline_val_acc:.3f}->{res.final_val_acc:.3f}")
+    assert m_after < m_before, "optimizer failed to compress"
+    assert drop <= 0.05 + 1e-9, f"accepted config violates threshold by {drop}"
+
+def test_novelty_metrics_smoke():
+    g = torch.Generator().manual_seed(0)
+    means = 8.0 * torch.nn.functional.one_hot(torch.arange(3), 64).float()
+    y = torch.repeat_interleave(torch.arange(3), 200)
+    task_data = means[y] + torch.randn(600, 64, generator=g)
+    m = clustering_metrics(task_data, 3, y.numpy(), seed=0)
+    assert m["hungarian_acc"] > 0.95
+    auroc = ood_detection_auroc(np.random.rand(200) + 1.0, np.random.rand(200))
+    assert 0.5 < auroc
+
+if __name__ == "__main__":
+    import time
+
+    t0 = time.time()
+    for name, fn in sorted(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            print(f"[RUN ] {name}")
+            fn()
+            print(f"[PASS] {name}")
+    print(f"All sanity tests passed in {time.time() - t0:.1f}s")
