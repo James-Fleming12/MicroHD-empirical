@@ -143,6 +143,84 @@ def test_dpq_components():
     assert mem_fp > mem_q > mem_dpq > 0
 
 
+def _max_cos(M: int, d: int, trials: int = 300, seed: int = 0) -> float:
+    """Mean over draws of the largest |cosine| a fresh random +/-1 vector
+    achieves against M random +/-1 prototypes in R^d."""
+    g = torch.Generator().manual_seed(seed)
+    vals = []
+    for _ in range(trials):
+        proto = torch.sign(torch.rand(M, d, generator=g) * 2 - 1)
+        fresh = torch.sign(torch.rand(d, generator=g) * 2 - 1)
+        vals.append((fresh @ proto.T).abs().max().item() / d)
+    return float(np.mean(vals))
+
+def test_interference_floor():
+    """Interference floor: max cosine of a fresh vector vs M prototypes ~ sqrt(2 ln M / d).
+
+    Validates the 'no room for other orthogonal vectors' claim of the theory
+    section: the floor rises ~1/sqrt(d), so halving d costs sqrt(2) in the
+    separation a novel direction can achieve.
+    """
+    M = 24
+    f128 = _max_cos(M, 128)
+    f10k = _max_cos(M, 10_000)
+    pred_ratio = math.sqrt(10_000 / 128)  # analytic floor ratio across d
+    emp_ratio = f128 / f10k
+    print(f"  floor d=128 {f128:.3f}, d=10k {f10k:.3f}: emp ratio {emp_ratio:.2f}, pred {pred_ratio:.2f}")
+    assert 0.6 * pred_ratio <= emp_ratio <= 1.4 * pred_ratio, \
+        f"interference floor must scale like sqrt(2 ln M / d), got ratio {emp_ratio:.2f}"
+
+def test_quant_scaling_tail():
+    """uniform-over-max quantization (MicroHD) is far coarser than MSE-PTQ.
+
+    The uniform step is set by max|P| ~ 5 sigma (the tail), so the bulk of a
+    Gaussian projection is coarsely represented; MSE-PTQ fits the bulk.
+    """
+    from modules.dpqhd import mse_ptq
+    from modules.hdc import uniform_quantize
+
+    g = torch.Generator().manual_seed(0)
+    P = torch.randn(4096, 64, generator=g) / 8.0
+    for b in (2, 3):
+        mse_u = ((uniform_quantize(P, b) - P) ** 2).mean().item()
+        mse_m = ((mse_ptq(P, b) - P) ** 2).mean().item()
+        print(f"  bits={b}: uniform MSE {mse_u:.4f} vs MSE-PTQ {mse_m:.4f}")
+        assert mse_u > 3 * mse_m, \
+            f"tail-scaled uniform quantization should be much coarser at {b} bits"
+
+def test_mse_ptq_flip_fraction():
+    """sign() absorbs MSE-PTQ noise: flips are few and scale linearly with sigma_eta.
+
+    Contrast: tail-scaled uniform quantization (MicroHD) flips many more
+    pre-activation signs at the same bitwidth — 'how you quantize matters'.
+    """
+    from modules.dpqhd import mse_ptq
+    from modules.hdc import bipolar_sign
+
+    F, D, n = 64, 4096, 2000
+    g = torch.Generator().manual_seed(0)
+    P = torch.randn(D, F, generator=g) / math.sqrt(F)
+    x = torch.randn(n, F, generator=g)
+    s = x @ P.T
+
+    flips, sig_eta = {}, {}
+    for b in (2, 3):
+        sq = x @ mse_ptq(P, b).T
+        flips[b] = (bipolar_sign(s) != bipolar_sign(sq)).float().mean().item()
+        sig_eta[b] = (sq - s).std().item()
+        qm = 2 ** (b - 1) - 1
+        delta = P.abs().max() / qm
+        Pu = torch.round(P / delta).clamp(-qm, qm) * delta
+        flu = (bipolar_sign(s) != bipolar_sign(x @ Pu.T)).float().mean().item()
+        print(f"  bits={b}: MSE-PTQ flip {flips[b]:.3f} vs uniform-over-max {flu:.3f}")
+        assert flips[b] < flu, "MSE-PTQ must flip fewer coordinates than uniform-over-max"
+    pred = sig_eta[2] / sig_eta[3]
+    emp = flips[2] / flips[3]
+    print(f"  flip scaling {emp:.2f} vs sigma-eta scaling {pred:.2f}")
+    assert 0.7 * pred <= emp <= 1.3 * pred, \
+        "flip fraction must scale linearly with the quantization-induced pre-activation noise"
+
+
 if __name__ == "__main__":
     import time
 

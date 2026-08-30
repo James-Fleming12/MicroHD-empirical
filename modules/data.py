@@ -59,6 +59,7 @@ class DomainShiftTask:
     x_test_src: torch.Tensor
     y_test_src: torch.Tensor
     targets: list[tuple[str, torch.Tensor, torch.Tensor]]  # (name, X, y), severity ascending
+    shift_dir: np.ndarray                                   # unit vector all means are translated along
 
 @dataclass
 class NovelClassTask:
@@ -131,6 +132,7 @@ def make_domain_shift_task(
         x_val=x_val, y_val=y_val,
         x_test_src=x_src, y_test_src=y_src,
         targets=targets,
+        shift_dir=shift_dir,
     )
 
 def make_novel_class_task(
