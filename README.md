@@ -291,6 +291,20 @@ left to average over. This is the mirror image of the paper's premise: keeping
 D preserves the *encoder* geometry (NMI, geometry fidelity), but the class-axis
 classifier has already spent its redundancy on the codebook.
 
+**This ordering is robust to the flip model.** The reversed result (prototypes
+≫ LogHD, ~10× not 2.5–3×) survives every modeling choice we varied: per-bit vs
+per-coordinate single-bit flips; max-scale vs MSE-optimal quantization; profiles
+quantized to the target precision vs kept fp32; the encoder excluded or included
+in the corrupted state; and a SparseHD-style top-magnitude sparsified comparator
+instead of trailing-dimension pruning. It also survives the regime where LogHD's
+clean accuracy is no longer the confounder: at C=12 with well-separated classes
+(spread=2.5) LogHD matches the baseline clean (0.999 vs 1.000) yet still falls
+to 0.90/0.36 at p=0.1/0.5 under flips while the prototypes hold 1.000. And in
+the paper's own ISOLET-like regime (C=26, k=2, n=5, memory 0.19×), feature-axis
+pruning to D'=1928 keeps 0.996 accuracy at every p while LogHD starts at 0.513
+and sinks to 0.38 by p=0.1. The paper's headline result does not appear on any
+of these tasks.
+
 ### The blind spot, in one line
 
 LogHD's encoder-side generalization is genuinely preserved (novel-class
