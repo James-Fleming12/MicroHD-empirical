@@ -305,6 +305,35 @@ pruning to D'=1928 keeps 0.996 accuracy at every p while LogHD starts at 0.513
 and sinks to 0.38 by p=0.1. The paper's headline result does not appear on any
 of these tasks.
 
+### VRAM and efficiency vs DPQ-HD
+
+LogHD's compression is *classifier-side only*: it replaces `C` prototypes with
+`n` bundles (`+ C·n` activation-profile values), but the encoder `P` (F×D) is
+untouched by design. On the standard workload (F=64, D=10k, C=30) that is a
+real but small saving, because the encoder dominates the model — smaller than
+DPQ-HD's saving on every axis:
+
+| config | total model | comp vs fp32 | per-query ops | ops vs baseline |
+|---|---|---|---|---|
+| baseline fp32 (P + W) | 3.59 MB | 1× | 940k | 1× |
+| LogHD k=2 n=5, fp32 | 2.63 MB | 1.36× | 690k | 1.36× |
+| LogHD k=2 n=5, model @4-bit | 337 KB | 10.9× | 690k | 1.36× |
+| DPQ r64-k50%-b3 | 174 KB | 21× | 474k | 2.0× |
+| DPQ r32-k30%-b3 | 69 KB | 53× | 188k | 5.0× |
+
+Classifier-side, LogHD cuts `C·D` → `n·D + C·n` (6× at k=2/n=5, 7.5× at k=3/n=4)
+and per-query class comparisons `C` → `n` (6× fewer). But that is a fraction of
+the footprint: keeping the full encoder leaves total VRAM at 2.63 MB (1.36×,
+fp32) — real savings only appear once the encoder is quantized too (10.9× at
+4-bit), which is precisely the step DPQ-HD already takes *and* extends with a
+low-rank decomposition of `P`. Per query, LogHD saves only the classifier
+comparisons (the `D·F` encoder cost is unchanged), so its 1.36× op reduction
+lags DPQ-HD's 2–5×. The resource story matches the accuracy story: DPQ-HD's
+safe operating point (r64-k50%-b3) is ~15× smaller than LogHD's fp32 model and
+~1.4× faster per query while *also* preserving ID/OOD generalization — the
+tradeoff LogHD accepts to keep `D` buys neither robustness nor footprint on
+these tasks.
+
 ### The blind spot, in one line
 
 LogHD's encoder-side generalization is genuinely preserved (novel-class
