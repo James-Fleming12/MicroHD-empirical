@@ -7,6 +7,11 @@ workloads, testing the hypothesis:
 > validation accuracy and destroys the random-projection geometry that supports
 > generalization — domain-shift robustness and novel-class discovery.
 
+MicroHD and DPQ-HD are feature-axis compressors; the last section (exp5) also
+stress-tests **LogHD** (Yun et al., arXiv:2511.03938), which compresses along
+the *class axis* instead, to see whether a compressor that never touches the
+encoder escapes the same failure modes.
+
 ## Layout
 
 ```
@@ -21,6 +26,9 @@ modules/
   dpqhd.py      # DPQ-HD post-training stages: low-rank decomposition (SVD or
                 # fresh random factors), trailing-dimension pruning views,
                 # MSE-based scale-search PTQ (Alg. 1), DPQ memory model
+  loghd.py      # LogHD class-axis compression: minimax-load k-ary codebook,
+                # bundle hypervectors, activation profiles, optional bundle
+                # refinement, plus bit-flip model-noise corruption + memory model
   data.py       # Synthetic tasks: domain shift (covariate shift + noise
                 # inflation, graded severity) and novel-class discovery
                 # (held-out classes from the same generative family)
@@ -29,7 +37,7 @@ modules/
                 # pairwise-geometry fidelity (spearman rho input vs encoded space)
 tests/test_sanity.py   # sanity checks (level HV orthogonality, geometry
                        # preservation, classifier sanity, resource formulas,
-                       # optimizer respects threshold, DPQ component checks)
+                       # optimizer respects threshold, DPQ + LogHD component checks)
 experiments/
   exp1_dimension_sweep.py       # sweep d, plot ID vs OOD curves
   exp2_microhd_generalization.py# full MicroHD runs vs baseline at 0.5/1/5% thresholds
@@ -37,6 +45,10 @@ experiments/
   exp4_margins.py               # ID vs OOD similarity margins across d/rank/keep/bits
   exp4_nullspace.py             # D-stage: novel classes in row space vs null space
   exp4_shift_visibility.py      # D-stage: fraction of shift direction visible vs r/F
+  exp5_loghd_generalization.py  # LogHD class-axis stress: matched-memory class-vs-
+                                # feature axis, C- and separation-sweeps, refinement
+  exp5_loghd_noise.py           # bit-flip robustness at matched memory (LogHD vs
+                                # feature-axis vs hybrid) on ID and OOD accuracy
 results/          # CSVs + PNG figures
 ```
 
@@ -51,6 +63,8 @@ python experiments/exp3_dpq_generalization.py --seeds 3
 python experiments/exp4_margins.py --seeds 3
 python experiments/exp4_nullspace.py --seeds 3
 python experiments/exp4_shift_visibility.py --seeds 3
+python experiments/exp5_loghd_generalization.py --seeds 3
+python experiments/exp5_loghd_noise.py --seeds 3
 ```
 
 Baseline hyper-parameters follow the paper: `d=10000`, `l=1024`, `q=16`,
@@ -178,6 +192,114 @@ The safe operating region keeps rank = F (lossless decomposition) with
 moderate pruning + aggressive MSE quantization: >20x compression with no
 generalization loss. Pushing rank below F is what destroys generalization —
 and a 128-sample ID calibration cannot detect it until ID itself degrades.
+
+## LogHD analysis (exp5, 3 seeds)
+
+**LogHD** (Yun et al., arXiv:2511.03938) compresses along the *class axis*,
+the dimension the previous sections leave untouched. Instead of shrinking `d`
+or quantizing the encoder, it keeps the full-dimensional encoder and replaces
+the `C` class prototypes with `n ≈ ⌈log_k C⌉ + ε` bundle hypervectors plus `C`
+activation profiles, cutting classifier memory from `O(CD)` to `O(D log_k C)`
+(`modules/loghd.py`, `results/exp5_*.csv`). We stress-test it on the same two
+tasks at matched classifier memory (`fig_exp5_{shift,novel}.png`).
+
+**The hypothesis was half right.** Because the encoder is untouched, everything
+that rides on the encoder *is* preserved: novel-class clustering NMI is
+identical to baseline (0.966 vs 0.966), and pairwise-geometry fidelity is
+unchanged. But the classifier LogHD substitutes — n-bundle cosines + nearest
+activation-profile decoding — is far weaker than C-prototype cosine decoding on
+these tasks, and this drags down ID accuracy, domain-shift OOD accuracy, and
+OOD-detection AUROC. The class axis is *not* a free lunch; it has its own
+superposition-interference bottleneck.
+
+### Clean accuracy collapses with class count C
+
+Matched-memory domain-shift task (baseline ID/OOD = 0.996/0.722):
+
+| model | k | n | mem | ID test | avg OOD |
+|---|---|---|---|---|---|
+| baseline | — | — | 1.0 | 0.996 | 0.722 |
+| feataxis (matched) | 2 | 5 | 0.167 | 0.995 | 0.685 |
+| LogHD | 2 | 5 | 0.167 | 0.439 | 0.240 |
+| LogHD | 2 | 7 | 0.234 | 0.587 | 0.264 |
+| LogHD | 3 | 4 | 0.134 | 0.338 | 0.161 |
+| LogHD | 3 | 6 | 0.201 | 0.501 | 0.231 |
+
+At the same memory budget, feature-axis pruning keeps ID ≈ 0.995 and OOD
+≈ 0.69 (the class prototypes are intact, just shorter); LogHD loses 40+ points
+of ID and OOD. Novel-class task (baseline ID/NMI/AUROC = 0.978/0.966/0.984):
+LogHD keeps NMI = 0.966 exactly but ID falls to 0.38–0.59 and OOD-detection
+AUROC to 0.56–0.60 (vs 0.983 for feature-axis).
+
+The degradation scales with class count (`exp5_loghd_csweep.csv`,
+`fig_exp5_csweep.png`):
+
+| C | baseline ID val | LogHD (k=2, n=⌈log₂C⌉) ID val |
+|---|---|---|
+| 5 | 1.000 | 0.920 |
+| 12 | 0.999 | 0.700 |
+| 20 | 0.998 | 0.553 |
+| 30 | 0.997 | 0.449 |
+
+Each bundle superposes ~C/2 prototypes, so the class-discriminative signal per
+activation coordinate is diluted by superposition cross-talk, and the decoder
+gets only `n ≈ log C` coordinates to separate C classes. The activation-space
+margin (nearest-wrong-profile distance minus own-profile distance) is ≈ 0 even
+on **training data** (mean −0.006 ID, −0.017 OOD), versus the 26σ/7.5σ cosine
+margins of the prototype classifier. Redundant bundles (ε up to +2) and the
+paper's bundle refinement (T=20, even with profiles re-estimated) recover only
+a few points — the bottleneck is the R^n activation-space SNR, not bundle
+count. Refinement alone with the paper's fixed profiles *hurts* (0.449 → 0.313).
+
+The regime where LogHD ≈ baseline is well-separated classes
+(`exp5_loghd_spread.csv`): at C=30, ID val recovers 0.449 → 0.667 → 0.884 →
+0.988 as class spread grows 0.7 → 1.0 → 1.5 → 2.5. The paper's real datasets
+(ISOLET, UCIHAR, PAGE, PAMAP2) sit in this easier regime; the synthetic
+domain-shift family is deliberately overlapping, so it exposes the
+superposition floor.
+
+### Model-noise robustness is inverted at matched memory (exp5b)
+
+The paper's headline is that class-axis compression sustains bit flips 2.5–3×
+longer than feature-axis compression at equal memory, because D is preserved.
+We test this on the C=12 shift task (UCIHAR-like regime) with per-bit flips on
+the quantized stored state (`exp5_loghd_noise.py`): flip probability `p` at
+which ID accuracy drops to 50% of clean (`p_id50`, higher = more robust):
+
+| model | mem | clean ID | bits=2 | bits=4 | bits=8 |
+|---|---|---|---|---|---|
+| full-D baseline | 1.0 | 0.999 | 0.408 | 0.409 | 0.414 |
+| feataxis (k2 n5 matched) | 0.42 | 0.999 | 0.403 | 0.408 | 0.414 |
+| feataxis (k3 n4 matched) | 0.33 | 0.999 | 0.399 | 0.413 | 0.412 |
+| LogHD (k2 n5) | 0.42 | 0.739 | 0.032 | 0.134 | 0.069 |
+| LogHD (k3 n4) | 0.33 | 0.695 | 0.030 | 0.063 | 0.084 |
+| hybrid (LogHD + 50% prune) | 0.21 | 0.736 | 0.032 | 0.131 | 0.068 |
+
+The ordering is **reversed**: feature-axis (and full-D) prototypes tolerate
+`p ≈ 0.40` at every bitwidth, while LogHD collapses at `p ≈ 0.03–0.13` —
+roughly 3–13× *less* fault tolerance, not 2.5–3× more. The same holds for OOD
+accuracy under flips (`p_ood90`, `fig_exp5_noise.png`).
+
+Why: robustness in HDC comes from *averaging*. The C-prototype classifier
+averages each query against C independent D-length vectors, so a bit flip in
+any one prototype coordinate is a 1/√D relative perturbation of a cosine. LogHD
+also averages over D per bundle, but the decision is then made on only
+`n ≈ log C` activation coordinates — every bundle/profile corruption shows up
+at full strength in one of the n values the decoder trusts, and the signal per
+coordinate is already small (superposition). There is no class-axis redundancy
+left to average over. This is the mirror image of the paper's premise: keeping
+D preserves the *encoder* geometry (NMI, geometry fidelity), but the class-axis
+classifier has already spent its redundancy on the codebook.
+
+### The blind spot, in one line
+
+LogHD's encoder-side generalization is genuinely preserved (novel-class
+structure, geometry), but its classifier-side performance — ID accuracy,
+domain-shift robustness, OOD detection, and bit-flip tolerance — is gated by a
+low-dimensional activation space whose SNR is set by the data's class
+separation, not by `D`. A stress test that only looks at encoder-side metrics
+(e.g. NMI) would approve it; one that looks at the classifier it actually
+deploys would not.
 
 ## Why compression breaks generalization (theory)
 

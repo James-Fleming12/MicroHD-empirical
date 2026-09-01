@@ -110,6 +110,7 @@ class TruncatedEncoder:
         self.keep = keep
         self.dim = keep
         self.num_features = base_encoder.num_features
+        self.device = base_encoder.device
 
     def fit_feature_range(self, x: torch.Tensor) -> None:
         pass  # API parity

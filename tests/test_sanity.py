@@ -16,6 +16,88 @@ from modules.metrics import clustering_metrics, geometry_fidelity, ood_detection
 from modules.microhd import MicroHDOptimizer
 from modules.resources import memory_bits, memory_kb
 
+def test_loghd_codebook():
+    from modules.loghd import build_codebook
+
+    # every class gets a unique code; no all-zero (invisible) class; balanced loads
+    B = build_codebook(30, 2, 5, seed=0)
+    assert B.shape == (30, 5)
+    assert len(B.unique(dim=0)) == 30, "codes must be unique"
+    assert (B != 0).any(dim=1).all(), "all-zero code makes a class invisible"
+    loads = B.float().sum(0)
+    assert loads.max() - loads.min() <= 2, f"minimax-load balance violated: {loads}"
+
+    B3 = build_codebook(30, 3, 4, seed=0)
+    assert len(B3.unique(dim=0)) == 30 and (B3 != 0).any(dim=1).all()
+
+def test_loghd_classifier_on_separable_data():
+    from modules.loghd import LogHDClassifier
+    from modules.metrics import accuracy
+
+    task = make_domain_shift_task(seed=0, num_classes=10, spread=1.5)
+    enc = ProjectionEncoder(task.x_train.shape[1], 4096, seed=0)
+    enc.fit_feature_range(task.x_train)
+    clf = HDClassifier(enc, 10).fit(task.x_train, task.y_train, epochs=10, seed=1)
+    base = accuracy(clf.predict(task.x_test_src), task.y_test_src)
+    lc = LogHDClassifier(enc, 10, alphabet=2, num_bundles=4).fit(task.x_train, task.y_train, seed=1)
+    lh = accuracy(lc.predict(task.x_test_src), task.y_test_src)
+    print(f"  easy task: baseline {base:.3f} vs LogHD {lh:.3f}")
+    assert lh > 0.9, f"LogHD should be near-baseline on well-separated data, got {lh}"
+
+def test_loghd_preserves_encoder_discovery():
+    """Class-axis compression leaves the encoder untouched, so novel-class
+    clustering quality (a function of the encoder only) must equal the baseline."""
+    from modules.loghd import LogHDClassifier
+    from modules.metrics import clustering_metrics
+
+    task = make_domain_shift_task(seed=0, num_classes=10, spread=1.5)
+    x_tr, y_tr = task.x_train, task.y_train
+    enc = ProjectionEncoder(x_tr.shape[1], 4096, seed=0)
+    enc.fit_feature_range(x_tr)
+    base_nmi = clustering_metrics(enc.encode(task.x_test_src), 10,
+                                  task.y_test_src.numpy(), seed=0)["nmi"]
+    lc = LogHDClassifier(enc, 10, alphabet=2, num_bundles=4).fit(x_tr, y_tr, seed=0)
+    lh_nmi = clustering_metrics(enc.encode(task.x_test_src), 10,
+                                task.y_test_src.numpy(), seed=0)["nmi"]
+    assert abs(base_nmi - lh_nmi) < 1e-9
+
+def test_loghd_memory_model():
+    from modules.loghd import loghd_memory_bits, matched_feature_keep
+
+    C, D, n = 30, 10000, 5
+    log_bits = loghd_memory_bits(C, D, n)
+    assert log_bits == n * D * 32 + C * n * 32
+    keep = matched_feature_keep(C, D, n)
+    feataxis_bits = keep * C * 32
+    assert abs(feataxis_bits - log_bits) <= 32 * C // 2, "matched memory budgets must agree"
+    # class-axis memory is logarithmic in C while conventional is linear
+    assert loghd_memory_bits(C, D, n) < 0.5 * C * D * 32
+
+def test_loghd_bitflip():
+    from modules.loghd import bitflip
+
+    g = torch.Generator().manual_seed(0)
+    t = torch.randn(50, 200, generator=g)
+    assert torch.equal(bitflip(t, 0.0, 4, seed=1), t), "p=0 must be a no-op"
+    # pre-quantize onto the b-bit grid so bit flips are the only source of change
+    def on_grid(x, bits):
+        qmax = 2 ** (bits - 1) - 1
+        s = x.abs().max() / qmax
+        return torch.round(x / s).clamp(-(qmax + 1), qmax) * s
+    diff = {}
+    for p in (0.05, 0.2, 0.5):
+        diff[p] = (bitflip(on_grid(t, 4), p, 4, seed=1) != on_grid(t, 4)).float().mean().item()
+    assert diff[0.05] < diff[0.2] < diff[0.5], f"flip rate must increase with p: {diff}"
+    # higher bitwidth: a flipped bit perturbs the signal less (smaller fraction
+    # of the stored value range on average).
+    def damage(bits):
+        base = on_grid(t, bits)
+        s = t.abs().max()
+        return (bitflip(base, 0.2, bits, seed=1) - base).abs().mean().item() / s
+    assert damage(2) > damage(8), "coarser precision must suffer larger relative corruption"
+
+
+
 def test_level_hv_structure():
     enc = IDEncoder(num_features=8, dim=2048, num_levels=64, seed=0)
     L = enc.level_hvs
